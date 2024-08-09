@@ -29,7 +29,7 @@ const client = new MongoClient(uri, {
   }
 });
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const access= process.env.access;
 const secretKey = 'your_secret_key'; // JWT Secret Key
 
 async function run() {
