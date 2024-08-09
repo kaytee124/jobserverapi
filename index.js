@@ -1,13 +1,23 @@
 const express = require('express');
-const app = express();
 const cors = require('cors');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
-const port = process.env.PORT || 5000;
-require('dotenv').config();
+const multer = require('multer'); // For handling file uploads
+const pdfParse = require('pdf-parse'); // For extracting text from PDFs
+const axios = require('axios');
+const jwt = require('jsonwebtoken');
+const dotenv = require('dotenv');
+const fs = require('fs');
 
-// Middleware here
+dotenv.config();
+const app = express();
+const port = process.env.PORT || 5000;
+
+// Middleware
 app.use(express.json());
 app.use(cors());
+
+// Multer setup for handling PDF uploads
+const upload = multer({ dest: 'uploads/' });
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@job-portal.wxmniyc.mongodb.net/?retryWrites=true&w=majority&appName=Job-portal`;
 
@@ -19,33 +29,36 @@ const client = new MongoClient(uri, {
   }
 });
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const secretKey = 'your_secret_key'; // JWT Secret Key
+
 async function run() {
   try {
     await client.connect();
 
     const db = client.db("jobPortal");
     const jobsCollection = db.collection("jobs");
-    const cvCollection = db.collection("cv"); // New collection for CVs
-    const usersCollection = db.collection("users"); // New collection for Users
+    const cvCollection = db.collection("cv");
+    const usersCollection = db.collection("users");
 
     // Creating index for job sorting last job posted will show first
-    const indexKeys = { title: 1, category: 1 }; 
-    const indexOptions = { name: "titleCategory" }; 
-    const result = await jobsCollection.createIndex(indexKeys, indexOptions);
+    const indexKeys = { title: 1, category: 1 };
+    const indexOptions = { name: "titleCategory" };
+    await jobsCollection.createIndex(indexKeys, indexOptions);
 
     // Post a job
     app.post("/post-job", async (req, res) => {
-        const body = req.body;
-        body.createdAt = new Date();
-        const result = await jobsCollection.insertOne(body);
-        if (result?.insertedId) {
-          return res.status(200).send(result);
-        } else {
-          return res.status(404).send({
-            message: "cannot insert, try again later",
-            status: false,
-          });
-        }
+      const body = req.body;
+      body.createdAt = new Date();
+      const result = await jobsCollection.insertOne(body);
+      if (result?.insertedId) {
+        return res.status(200).send(result);
+      } else {
+        return res.status(404).send({
+          message: "cannot insert, try again later",
+          status: false,
+        });
+      }
     });
 
     // Get all jobs
@@ -71,27 +84,87 @@ async function run() {
       }
     });
 
-    // Handle CV submission for a job
-    app.post("/all-jobs/:id", async (req, res) => {
+    // Handle CV submission for a job with skill matching
+    app.post("/all-jobs/:id", upload.single('cv'), async (req, res) => {
       const jobId = req.params.id;
-      const { cvUrl, email } = req.body; // Get email from request body
+      const { email } = req.body; // Get email from request body
+      const job = await jobsCollection.findOne({ _id: new ObjectId(jobId) });
 
-      // Insert the CV URL and email into the CV collection
-      const cvData = {
-        jobId: new ObjectId(jobId),
-        cvUrl: cvUrl,
-        email: email, // Include email in cvData
-        submittedAt: new Date(),
-      };
-
-      const result = await cvCollection.insertOne(cvData);
-      if (result?.insertedId) {
-        res.status(200).send(result);
-      } else {
-        res.status(404).send({
-          message: "Cannot submit CV, try again later",
+      if (!job) {
+        return res.status(404).send({
+          message: "Job not found",
           status: false,
         });
+      }
+
+      if (!req.file) {
+        return res.status(400).send({
+          message: "No CV file uploaded",
+          status: false,
+        });
+      }
+
+      try {
+        // Read the uploaded file
+        const dataBuffer = fs.readFileSync(req.file.path);
+        // Extract text from PDF
+        const pdfData = await pdfParse(dataBuffer);
+        const cvText = pdfData.text;
+
+        // Extract actual skill names from the job's skills array
+        const jobSkills = job.skills.map(skillObj => skillObj.value); // Assuming each skill object has a 'name' field
+
+        // Match CV skills with job skills using OpenAI API
+        const openAIResponse = await axios.post(
+          'https://api.openai.com/v1/chat/completions',
+          {
+            model: 'gpt-4',
+            messages: [
+              { role: 'system', content: 'You are an assistant that matches job skills.' },
+              { role: 'user', content: `Job skills:\n${jobSkills.join(", ")}\n\nCV Text:\n${cvText}\n\nDoes the CV contain at least 60% of the required skills?` }
+            ],
+            temperature: 0.7,
+          },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+            },
+          }
+        );
+
+        const botMessage = openAIResponse.data.choices[0].message.content.trim().toLowerCase();
+        console.log("OpenAI Response:", botMessage); // Debugging log
+
+        // Store the CV and the match result in the database
+        const cvData = {
+          jobId: new ObjectId(jobId),
+          email,
+          cvText,
+          matchResult: botMessage.includes('yes'),
+          submittedAt: new Date(),
+        };
+
+        const result = await cvCollection.insertOne(cvData);
+        console.log("Insert Result:", result); // Debugging log
+
+        if (result?.insertedId) {
+          res.status(200).send({
+            message: "CV submitted successfully",
+            match: cvData.matchResult,
+          });
+        } else {
+          res.status(500).send({
+            message: "Cannot submit CV, try again later",
+            status: false,
+          });
+        }
+      } catch (error) {
+        console.error('Error:', error.response ? error.response.data : error.message);
+        res.status(500).send({ error: 'Something went wrong!' });
+      } finally {
+        // Clean up the uploaded file
+        fs.unlinkSync(req.file.path);
       }
     });
 
@@ -118,7 +191,7 @@ async function run() {
         Email,
         PhoneNumber,
         Origin,
-        CompanyName: userType === 'employer' ? CompanyName : null, // Only include CompanyName for employers
+        CompanyName: userType === 'employer' ? CompanyName : null,
         Password,
         createdAt: new Date(),
       };
@@ -136,17 +209,14 @@ async function run() {
       if (result?.insertedId) {
         res.status(200).send(result);
       } else {
-        res.status(404).send({
+        return res.status(404).send({
           message: "Cannot register user, try again later",
           status: false,
         });
       }
     });
-  
-    // Login endpoint
-    const jwt = require('jsonwebtoken');
-    const secretKey = 'your_secret_key';
 
+    // Login endpoint
     app.post("/login", async (req, res) => {
       const { email, password } = req.body;
 
@@ -165,7 +235,7 @@ async function run() {
         return res.status(200).send({
           message: "Login successful",
           status: true,
-          token, // Return the token
+          token,
           user,
         });
       } catch (error) {
@@ -193,6 +263,7 @@ async function run() {
     // Do not close the connection
   }
 }
+
 run().catch(console.dir);
 
 app.listen(port, () => {
